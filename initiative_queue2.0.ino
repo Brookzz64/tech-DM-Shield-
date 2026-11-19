@@ -2,6 +2,9 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+
+#include "arduino_secrets.h"
+#include "thingProperties.h"
 #include "sprites.h"
 
 // =====================================
@@ -10,6 +13,7 @@
 
 #define LARGURA 128
 #define ALTURA 64
+
 #define OLED_RESET -1
 #define OLED_ENDERECO 0x3C
 
@@ -30,58 +34,26 @@ Adafruit_SSD1306 display(
 );
 
 // =====================================
-// BACKGROUND
-// =====================================
-
-// Ponteiros para o fundo selecionado
-const uint8_t* fundoSuperiorAtual;
-const uint8_t* fundoInferiorAtual;
-
-// Seleciona o background no setup
-void configurarFundo() {
-  fundoSuperiorAtual = fundoSuperior;
-  fundoInferiorAtual = fundoInferior;
-}
-
-// Desenha as duas faixas
-void desenharFundo() {
-
-  display.drawBitmap(
-    0, 0,
-    fundoSuperiorAtual,
-    LARGURA_FUNDO,
-    ALTURA_FAIXA,
-    SSD1306_WHITE
-  );
-
-  display.drawBitmap(
-    0, 48,
-    fundoInferiorAtual,
-    LARGURA_FUNDO,
-    ALTURA_FAIXA,
-    SSD1306_WHITE
-  );
-}
-
-// =====================================
-// ESTRUTURA DA FILA
+// ESTRUTURA DOS PERSONAGENS
 // =====================================
 
 struct Animacao {
   PersonagemID id;
   int x;
-  int xInicial;
   int y;
 };
 
 Animacao fila[MAX_PERSONAGENS];
 
+PersonagemID ordemSalva[MAX_PERSONAGENS];
+
 uint8_t quantidadeFila = 0;
+uint8_t quantidadeOrdem = 0;
 
 bool personagemSaindo = false;
 
 // =====================================
-// CONTROLE DO BOTÃO
+// CONTROLE DO BOTÃO FÍSICO
 // =====================================
 
 bool ultimaLeituraBotao = HIGH;
@@ -90,6 +62,86 @@ bool estadoEstavelBotao = HIGH;
 unsigned long tempoDebounce = 0;
 
 #define DEBOUNCE_MS 40
+
+// =====================================
+// DESENHAR BACKGROUND
+// =====================================
+
+void desenharFundo() {
+
+  int fundo = FundoSelecionado;
+
+  // Proteção contra índices inválidos
+  if (fundo < 0 || fundo >= TOTAL_FUNDOS) {
+    fundo = 0;
+  }
+
+  // Faixa superior
+  display.drawBitmap(
+    0,
+    0,
+    fundosSuperiores[fundo],
+    LARGURA_FUNDO,
+    ALTURA_FAIXA,
+    SSD1306_WHITE
+  );
+
+  // Faixa inferior
+  display.drawBitmap(
+    0,
+    48,
+    fundosInferiores[fundo],
+    LARGURA_FUNDO,
+    ALTURA_FAIXA,
+    SSD1306_WHITE
+  );
+}
+
+// =====================================
+// IDENTIFICAR PERSONAGEM PELO NOME
+// =====================================
+
+bool identificarPersonagem(String nome, PersonagemID &id) {
+
+  nome.trim();
+  nome.toUpperCase();
+
+  if (nome == "BALAZAR") {
+    id = BALAZAR;
+  }
+  else if (nome == "DIANA") {
+    id = DIANA;
+  }
+  else if (nome == "KEYLETH") {
+    id = KEYLETH;
+  }
+  else if (nome == "MILO") {
+    id = MILO;
+  }
+  else if (nome == "FRITZ") {
+    id = FRITZ;
+  }
+  else if (nome == "INIMIGOG") {
+    id = INIMIGOG;
+  }
+	else if (nome == "INIMIGOM") {
+    id = INIMIGOM;
+  }
+	else if (nome == "INIMIGOP") {
+    id = INIMIGOP;
+  }
+	else if (nome == "AZRIEL") {
+    id = AZRIEL;
+  }
+	else if (nome == "BOB") {
+    id = BOB;
+  }
+  else {
+    return false;
+  }
+
+  return true;
+}
 
 // =====================================
 // ADICIONAR PERSONAGEM
@@ -102,39 +154,115 @@ void adicionarPersonagem(PersonagemID id, int x, int y) {
   const uint8_t totalSprites =
     sizeof(sprites) / sizeof(sprites[0]);
 
-  if (identificador >= totalSprites) {
-    Serial.println("Personagem nao encontrado!");
-    return;
-  }
-
-  if (quantidadeFila >= MAX_PERSONAGENS) {
-    Serial.println("Fila cheia!");
+  if (identificador >= totalSprites ||
+      quantidadeFila >= MAX_PERSONAGENS) {
     return;
   }
 
   fila[quantidadeFila].id = id;
   fila[quantidadeFila].x = x;
-  fila[quantidadeFila].xInicial = x;
   fila[quantidadeFila].y = y;
 
   quantidadeFila++;
 }
 
 // =====================================
-// INICIAR FILA
+// MONTAR FILA A PARTIR DA ORDEM SALVA
 // =====================================
 
-void iniciarFila() {
+void montarFila() {
 
   quantidadeFila = 0;
   personagemSaindo = false;
 
-  adicionarPersonagem(BALAZAR, -32, 16);
-  adicionarPersonagem(DIANA, -72, 16);
-  adicionarPersonagem(KEYLETH, -112, 16);
-  adicionarPersonagem(MILO, -152, 16);
-  adicionarPersonagem(FRITZ, -192, 16);
-  adicionarPersonagem(INIMIGO, -232, 16);
+  for (int i = 0; i < quantidadeOrdem; i++) {
+
+    int posicaoX =
+      -LARGURA_SPRITE - (i * ESPACO_FILA);
+
+    adicionarPersonagem(
+      ordemSalva[i],
+      posicaoX,
+      16
+    );
+  }
+}
+
+// =====================================
+// RECEBER ORDEM DO ARDUINO CLOUD
+// =====================================
+
+void configurarIniciativa(const String &lista) {
+
+  quantidadeOrdem = 0;
+
+  int inicio = 0;
+
+  while (inicio < lista.length() &&
+         quantidadeOrdem < MAX_PERSONAGENS) {
+
+    int fim = lista.indexOf(',', inicio);
+
+    if (fim == -1) {
+      fim = lista.length();
+    }
+
+    String nome = lista.substring(inicio, fim);
+
+    nome.trim();
+
+    if (nome.length() > 0) {
+
+      PersonagemID id;
+
+      if (identificarPersonagem(nome, id)) {
+
+        ordemSalva[quantidadeOrdem] = id;
+        quantidadeOrdem++;
+
+      }
+      else {
+
+        Serial.print("Personagem desconhecido: ");
+        Serial.println(nome);
+
+      }
+    }
+
+    inicio = fim + 1;
+  }
+
+  // Monta novamente a fila
+  montarFila();
+
+  status = "Iniciativa carregada: " +
+           String(quantidadeOrdem) +
+           " participantes";
+
+  Serial.println(status);
+}
+
+// =====================================
+// AVANÇAR INICIATIVA
+// =====================================
+
+void avancarFila() {
+
+  if (quantidadeFila == 0 || personagemSaindo) {
+    return;
+  }
+
+  // Aguarda chegar ao centro
+  if (fila[0].x < CENTRO_X) {
+
+    status = "Aguarde o personagem chegar ao centro";
+
+    return;
+  }
+
+  personagemSaindo = true;
+
+  status = "Personagem saindo";
 }
 
 // =====================================
@@ -153,27 +281,7 @@ void removerPrimeiro() {
 }
 
 // =====================================
-// AVANÇAR INICIATIVA
-// =====================================
-
-void avancarFila() {
-
-  if (quantidadeFila == 0 || personagemSaindo) {
-    return;
-  }
-
-  if (fila[0].x < CENTRO_X) {
-    Serial.println("Aguarde o personagem chegar ao centro!");
-    return;
-  }
-
-  personagemSaindo = true;
-
-  Serial.println("Personagem saindo!");
-}
-
-// =====================================
-// LER BOTÃO
+// LER BOTÃO FÍSICO
 // =====================================
 
 void lerBotao() {
@@ -183,8 +291,10 @@ void lerBotao() {
   bool leitura = digitalRead(PINO_BOTAO);
 
   if (leitura != ultimaLeituraBotao) {
+
     ultimaLeituraBotao = leitura;
     tempoDebounce = agora;
+
   }
 
   if (agora - tempoDebounce >= DEBOUNCE_MS) {
@@ -206,7 +316,8 @@ void lerBotao() {
 
 void desenharPersonagem(int indice, int frame) {
 
-  uint8_t id = static_cast<uint8_t>(fila[indice].id);
+  uint8_t id =
+    static_cast<uint8_t>(fila[indice].id);
 
   display.drawBitmap(
     fila[indice].x,
@@ -219,7 +330,7 @@ void desenharPersonagem(int indice, int frame) {
 }
 
 // =====================================
-// ATUALIZAR SISTEMA
+// ATUALIZAR ANIMAÇÃO
 // =====================================
 
 void atualizarSistema() {
@@ -236,41 +347,49 @@ void atualizarSistema() {
 
   display.clearDisplay();
 
-  // Desenha o background primeiro
+  // Fundo sempre desenhado primeiro
   desenharFundo();
 
   // =================================
-  // PERSONAGEM ESTÁ SAINDO
+  // PERSONAGEM SAINDO
   // =================================
 
-  if (personagemSaindo) {
+  if (personagemSaindo && quantidadeFila > 0) {
 
     fila[0].x++;
 
+    // Quando sair completamente
     if (fila[0].x >= LARGURA) {
 
       removerPrimeiro();
 
       personagemSaindo = false;
 
-      if (quantidadeFila == 0) {
-        iniciarFila();
+      // Reinicia a rodada quando todos saírem
+      if (quantidadeFila == 0 &&
+          quantidadeOrdem > 0) {
+
+        montarFila();
+
+        status = "Nova rodada iniciada";
       }
     }
   }
 
   // =================================
-  // DESENHAR SAÍDA
+  // DESENHAR FILA
   // =================================
 
-  if (personagemSaindo) {
+  if (personagemSaindo && quantidadeFila > 0) {
 
+    // Personagem atual caminhando para fora
     int frameAtual =
-      1 + ((fila[0].x - fila[0].xInicial) /
-      VELOCIDADE_ANIMACAO) % 2;
+      1 + ((agora / (INTERVALO_MOVIMENTO *
+      VELOCIDADE_ANIMACAO)) % 2);
 
     desenharPersonagem(0, frameAtual);
 
+    // Os demais aguardam de perfil
     for (int i = 1; i < quantidadeFila; i++) {
       desenharPersonagem(i, 1);
     }
@@ -284,7 +403,8 @@ void atualizarSistema() {
 
     for (int i = 0; i < quantidadeFila; i++) {
 
-      int destinoX = CENTRO_X - (i * ESPACO_FILA);
+      int destinoX =
+        CENTRO_X - (i * ESPACO_FILA);
 
       bool andando = fila[i].x < destinoX;
 
@@ -295,18 +415,24 @@ void atualizarSistema() {
       int frameAtual;
 
       if (i == 0 && fila[i].x >= CENTRO_X) {
-        // Primeiro personagem olhando para frente
+
+        // Primeiro: olhando para frente
         frameAtual = 0;
+
       }
       else if (andando) {
-        // Caminhada: frames 2 e 3
+
+        // Caminhando: frames 2 e 3
         frameAtual =
-          1 + ((fila[i].x - fila[i].xInicial) /
-          VELOCIDADE_ANIMACAO) % 2;
+          1 + ((agora / (INTERVALO_MOVIMENTO *
+          VELOCIDADE_ANIMACAO) + i) % 2);
+
       }
       else {
-        // Espera de perfil
+
+        // Esperando: perfil parado
         frameAtual = 1;
+
       }
 
       desenharPersonagem(i, frameAtual);
@@ -314,6 +440,62 @@ void atualizarSistema() {
   }
 
   display.display();
+}
+
+// =====================================
+// CALLBACKS DO ARDUINO CLOUD
+// =====================================
+
+void onOrdemIniciativaChange() {
+
+  configurarIniciativa(ordemIniciativa);
+}
+
+void onFundoSelecionadoChange() {
+
+  if (FundoSelecionado < 0 ||
+      FundoSelecionado >= TOTAL_FUNDOS) {
+
+    status = "Fundo invalido";
+
+  }
+  else {
+
+    status = "Fundo selecionado: " +
+             String(FundoSelecionado);
+
+  }
+
+  Serial.println(status);
+}
+
+void onAvancarChange() {
+
+  if (avancar) {
+
+    avancarFila();
+
+    // Retorna o botão virtual ao estado desligado
+    avancar = false;
+  }
+}
+
+void onStatusChange() {
+
+  Serial.print("Status recebido: ");
+  Serial.println(status);
+}
+
+// Chamado quando todas as propriedades são sincronizadas
+void aoSincronizar() {
+
+  Serial.println("Arduino Cloud sincronizado!");
+
+  if (ordemIniciativa.length() > 0) {
+    configurarIniciativa(ordemIniciativa);
+  }
+
+  status = "Escudo conectado e pronto";
 }
 
 // =====================================
@@ -328,6 +510,7 @@ void setup() {
 
   pinMode(PINO_BOTAO, INPUT_PULLUP);
 
+  // Inicializa OLED
   if (!display.begin(
     SSD1306_SWITCHCAPVCC,
     OLED_ENDERECO
@@ -342,15 +525,28 @@ void setup() {
 
   display.clearDisplay();
 
-  // Configura o background
-  configurarFundo();
+  // Inicializa as propriedades do Cloud
+  initProperties();
 
-  // Inicializa a fila
-  iniciarFila();
+  // Fila padrão enquanto aguarda a sincronização
+  configurarIniciativa(
+    "BALAZAR,DIANA,KEYLETH,MILO,FRITZ,INIMIGO"
+  );
 
-  // Exibe o fundo imediatamente
-  desenharFundo();
-  display.display();
+  // Inicializa conexão com Arduino Cloud
+  ArduinoCloud.begin(
+    ArduinoIoTPreferredConnection
+  );
+
+  // Detecta sincronização inicial
+  ArduinoCloud.addCallback(
+    ArduinoIoTCloudEvent::SYNC,
+    aoSincronizar
+  );
+
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
 }
 
 // =====================================
@@ -359,10 +555,10 @@ void setup() {
 
 void loop() {
 
-  lerBotao();
-  atualizarSistema();
+  ArduinoCloud.update();
 
-  // Futuramente:
-  // ArduinoCloud.update();
+  lerBotao();
+
+  atualizarSistema();
 
 }
