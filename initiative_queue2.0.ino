@@ -1,4 +1,3 @@
-
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -7,35 +6,31 @@
 #include "thingProperties.h"
 #include "sprites.h"
 
-// =====================================
-// CONFIGURAÇÕES
-// =====================================
+// ---------------- CONFIGURAÇÕES ----------------
 
-#define LARGURA 128
-#define ALTURA 64
+#define LARGURA_TELA 128
+#define ALTURA_TELA 64
 
-#define OLED_RESET -1
-#define OLED_ENDERECO 0x3C
-
-#define MAX_PERSONAGENS 20
 #define PINO_BOTAO 3
 
-#define INTERVALO_MOVIMENTO 30
-#define VELOCIDADE_ANIMACAO 4
+#define MAX_PERSONAGENS 6
+
+#define CENTRO_X 48
 #define ESPACO_FILA 40
 
-#define CENTRO_X ((LARGURA - LARGURA_SPRITE) / 2)
+#define VELOCIDADE 2
+#define INTERVALO_MOVIMENTO 120
+
+#define TEMPO_DEBOUNCE 40
 
 Adafruit_SSD1306 display(
-  LARGURA,
-  ALTURA,
+  LARGURA_TELA,
+  ALTURA_TELA,
   &Wire,
-  OLED_RESET
+  -1
 );
 
-// =====================================
-// ESTRUTURA DOS PERSONAGENS
-// =====================================
+// ---------------- ESTRUTURA DA FILA ----------------
 
 struct Animacao {
   PersonagemID id;
@@ -50,58 +45,224 @@ PersonagemID ordemSalva[MAX_PERSONAGENS];
 uint8_t quantidadeFila = 0;
 uint8_t quantidadeOrdem = 0;
 
+// ---------------- ESTADOS DO SISTEMA ----------------
+
 bool personagemSaindo = false;
+bool modoMenu = true;
 
-// =====================================
-// CONTROLE DO BOTÃO FÍSICO
-// =====================================
+bool cloudSincronizado = false;
 
+String ultimaOrdemProcessada = "";
+
+uint8_t frameAndando = 1;
+
+unsigned long ultimoFrameMovimento = 0;
+
+// ---------------- BOTÃO ----------------
+
+bool estadoBotaoEstavel = HIGH;
 bool ultimaLeituraBotao = HIGH;
-bool estadoEstavelBotao = HIGH;
 
-unsigned long tempoDebounce = 0;
+unsigned long ultimoDebounce = 0;
 
-#define DEBOUNCE_MS 40
+// ====================================================
+// INICIALIZAÇÃO
+// ====================================================
 
-// =====================================
-// DESENHAR BACKGROUND
-// =====================================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(PINO_BOTAO, INPUT_PULLUP);
+
+  Wire.begin(8, 9);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Erro ao iniciar OLED!");
+    while (true) {}
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  // Mostra o logo ao ligar o dispositivo
+  modoMenu = true;
+  mostrarLogo();
+
+  // Inicializa Arduino Cloud
+  initProperties();
+
+  ArduinoCloud.addCallback(
+    ArduinoIoTCloudEvent::SYNC,
+    aoSincronizar
+  );
+
+  ArduinoCloud.begin(
+    ArduinoIoTPreferredConnection
+  );
+
+  setDebugMessageLevel(2);
+  ArduinoCloud.printDebugInfo();
+
+  Serial.println("Sistema iniciado!");
+}
+
+// ====================================================
+// LOOP PRINCIPAL
+// ====================================================
+
+void loop() {
+
+  ArduinoCloud.update();
+
+  lerBotao();
+
+  atualizarSistema();
+}
+
+// ====================================================
+// LOGO E TELA
+// ====================================================
+
+void mostrarLogo() {
+
+  display.clearDisplay();
+
+  display.drawBitmap(
+    0,
+    0,
+    logoIdle,
+    128,
+    64,
+    SSD1306_WHITE
+  );
+
+  display.display();
+}
+
+// ====================================================
+// DESENHAR CENÁRIO
+// ====================================================
 
 void desenharFundo() {
 
   int fundo = FundoSelecionado;
 
-  // Proteção contra índices inválidos
   if (fundo < 0 || fundo >= TOTAL_FUNDOS) {
     fundo = 0;
   }
 
-  // Faixa superior
   display.drawBitmap(
     0,
     0,
     fundosSuperiores[fundo],
-    LARGURA_FUNDO,
-    ALTURA_FAIXA,
+    128,
+    16,
     SSD1306_WHITE
   );
 
-  // Faixa inferior
   display.drawBitmap(
     0,
     48,
     fundosInferiores[fundo],
-    LARGURA_FUNDO,
-    ALTURA_FAIXA,
+    128,
+    16,
     SSD1306_WHITE
   );
 }
 
-// =====================================
-// IDENTIFICAR PERSONAGEM PELO NOME
-// =====================================
+// ====================================================
+// DESENHAR PERSONAGENS
+// ====================================================
 
-bool identificarPersonagem(String nome, PersonagemID &id) {
+void desenharTela() {
+
+  if (modoMenu) {
+    mostrarLogo();
+    return;
+  }
+
+  display.clearDisplay();
+
+  desenharFundo();
+
+  for (uint8_t i = 0; i < quantidadeFila; i++) {
+
+    uint8_t frame;
+
+    int destino = CENTRO_X - (i * ESPACO_FILA);
+
+    // Personagem da frente
+    if (i == 0) {
+
+      if (personagemSaindo) {
+        frame = frameAndando;
+      }
+      else if (fila[i].x >= CENTRO_X) {
+        frame = 0;
+      }
+      else {
+        frame = frameAndando;
+      }
+    }
+
+    // Demais personagens
+    else {
+
+      if (fila[i].x >= destino) {
+        frame = 1;
+      }
+      else {
+        frame = frameAndando;
+      }
+    }
+
+    display.drawBitmap(
+      fila[i].x,
+      fila[i].y,
+      sprites[fila[i].id][frame],
+      LARGURA_SPRITE,
+      ALTURA_SPRITE,
+      SSD1306_WHITE
+    );
+  }
+
+  display.display();
+}
+
+// ====================================================
+// MONTAR FILA
+// ====================================================
+
+void montarFila() {
+
+  quantidadeFila = quantidadeOrdem;
+
+  personagemSaindo = false;
+  modoMenu = false;
+
+  frameAndando = 1;
+
+  for (uint8_t i = 0; i < quantidadeOrdem; i++) {
+
+    fila[i].id = ordemSalva[i];
+
+    fila[i].x = -32 - (i * ESPACO_FILA);
+
+    fila[i].y = 16;
+  }
+
+  ultimoFrameMovimento = millis();
+}
+
+// ====================================================
+// IDENTIFICAR PERSONAGEM PELO NOME
+// ====================================================
+
+bool identificarPersonagem(
+  String nome,
+  PersonagemID &id
+) {
 
   nome.trim();
   nome.toUpperCase();
@@ -143,119 +304,128 @@ bool identificarPersonagem(String nome, PersonagemID &id) {
   return true;
 }
 
-// =====================================
-// ADICIONAR PERSONAGEM
-// =====================================
+// ====================================================
+// RECEBER COMANDO DE INICIATIVA
+// ====================================================
 
-void adicionarPersonagem(PersonagemID id, int x, int y) {
+void configurarIniciativa(String lista) {
 
-  uint8_t identificador = static_cast<uint8_t>(id);
+  String comando = lista;
 
-  const uint8_t totalSprites =
-    sizeof(sprites) / sizeof(sprites[0]);
+  comando.trim();
+  comando.toUpperCase();
 
-  if (identificador >= totalSprites ||
-      quantidadeFila >= MAX_PERSONAGENS) {
+  // Comando MENU
+  if (comando == "MENU" || comando.length() == 0) {
+
+    quantidadeFila = 0;
+    quantidadeOrdem = 0;
+
+    personagemSaindo = false;
+    modoMenu = true;
+
+    status = "Menu";
+
+    mostrarLogo();
+
+    Serial.println("Voltando ao menu");
+
     return;
   }
 
-  fila[quantidadeFila].id = id;
-  fila[quantidadeFila].x = x;
-  fila[quantidadeFila].y = y;
+  // Monta uma nova ordem temporária
+  PersonagemID novaOrdem[MAX_PERSONAGENS];
 
-  quantidadeFila++;
-}
-
-// =====================================
-// MONTAR FILA A PARTIR DA ORDEM SALVA
-// =====================================
-
-void montarFila() {
-
-  quantidadeFila = 0;
-  personagemSaindo = false;
-
-  for (int i = 0; i < quantidadeOrdem; i++) {
-
-    int posicaoX =
-      -LARGURA_SPRITE - (i * ESPACO_FILA);
-
-    adicionarPersonagem(
-      ordemSalva[i],
-      posicaoX,
-      16
-    );
-  }
-}
-
-// =====================================
-// RECEBER ORDEM DO ARDUINO CLOUD
-// =====================================
-
-void configurarIniciativa(const String &lista) {
-
-  quantidadeOrdem = 0;
+  uint8_t novaQuantidade = 0;
 
   int inicio = 0;
 
-  while (inicio < lista.length() &&
-         quantidadeOrdem < MAX_PERSONAGENS) {
+  while (inicio < comando.length()) {
 
-    int fim = lista.indexOf(',', inicio);
+    int separador = comando.indexOf(',', inicio);
 
-    if (fim == -1) {
-      fim = lista.length();
+    String nome;
+
+    if (separador == -1) {
+
+      nome = comando.substring(inicio);
+
+      inicio = comando.length();
     }
+    else {
 
-    String nome = lista.substring(inicio, fim);
+      nome = comando.substring(inicio, separador);
+
+      inicio = separador + 1;
+    }
 
     nome.trim();
 
-    if (nome.length() > 0) {
-
-      PersonagemID id;
-
-      if (identificarPersonagem(nome, id)) {
-
-        ordemSalva[quantidadeOrdem] = id;
-        quantidadeOrdem++;
-
-      }
-      else {
-
-        Serial.print("Personagem desconhecido: ");
-        Serial.println(nome);
-
-      }
+    if (nome.length() == 0) {
+      continue;
     }
 
-    inicio = fim + 1;
+    if (novaQuantidade >= MAX_PERSONAGENS) {
+      break;
+    }
+
+    PersonagemID personagem;
+
+    if (identificarPersonagem(nome, personagem)) {
+
+      novaOrdem[novaQuantidade] = personagem;
+
+      novaQuantidade++;
+    }
+    else {
+
+      status = "Personagem desconhecido: " + nome;
+
+      Serial.print("Personagem desconhecido: ");
+      Serial.println(nome);
+
+      return;
+    }
   }
 
-  // Monta novamente a fila
-  montarFila();
+  if (novaQuantidade == 0) {
 
-  status = "Iniciativa carregada: " +
-           String(quantidadeOrdem) +
-           " participantes";
+    status = "Nenhum personagem encontrado";
 
-  Serial.println(status);
-}
-
-// =====================================
-// AVANÇAR INICIATIVA
-// =====================================
-
-void avancarFila() {
-
-  if (quantidadeFila == 0 || personagemSaindo) {
     return;
   }
 
-  // Aguarda chegar ao centro
+  // Salva a ordem original
+  quantidadeOrdem = novaQuantidade;
+
+  for (uint8_t i = 0; i < quantidadeOrdem; i++) {
+
+    ordemSalva[i] = novaOrdem[i];
+  }
+
+  montarFila();
+
+  status = "Iniciativa carregada: " + String(quantidadeOrdem);
+
+  Serial.println("Nova iniciativa carregada!");
+}
+
+// ====================================================
+// AVANÇAR INICIATIVA
+// ====================================================
+
+void avancarFila() {
+
+  if (modoMenu) return;
+
+  if (quantidadeFila == 0) return;
+
+  if (personagemSaindo) return;
+
+  // Impede avançar antes do personagem chegar ao centro
   if (fila[0].x < CENTRO_X) {
 
-    status = "Aguarde o personagem chegar ao centro";
+    status = "Aguarde o personagem chegar";
 
     return;
   }
@@ -263,302 +433,213 @@ void avancarFila() {
   personagemSaindo = true;
 
   status = "Personagem saindo";
+
+  Serial.println("Avancando iniciativa");
 }
 
-// =====================================
+// ====================================================
 // REMOVER PRIMEIRO PERSONAGEM
-// =====================================
+// ====================================================
 
 void removerPrimeiro() {
 
-  for (int i = 0; i < quantidadeFila - 1; i++) {
-    fila[i] = fila[i + 1];
+  if (quantidadeFila == 0) return;
+
+  for (uint8_t i = 1; i < quantidadeFila; i++) {
+
+    fila[i - 1] = fila[i];
   }
 
-  if (quantidadeFila > 0) {
-    quantidadeFila--;
-  }
+  quantidadeFila--;
+
+  personagemSaindo = false;
 }
 
-// =====================================
-// LER BOTÃO FÍSICO
-// =====================================
+// ====================================================
+// ATUALIZAR MOVIMENTAÇÃO
+// ====================================================
 
-void lerBotao() {
+void atualizarSistema() {
+
+  if (modoMenu) return;
+
+  if (quantidadeFila == 0) return;
 
   unsigned long agora = millis();
+
+  if (agora - ultimoFrameMovimento < INTERVALO_MOVIMENTO) {
+    return;
+  }
+
+  ultimoFrameMovimento = agora;
+
+  // Alterna os frames de caminhada
+  if (frameAndando == 1) {
+    frameAndando = 2;
+  }
+  else {
+    frameAndando = 1;
+  }
+
+  // Se o personagem da frente está saindo
+  if (personagemSaindo) {
+
+    fila[0].x += VELOCIDADE;
+
+    // Quando sair completamente da tela
+    if (fila[0].x >= LARGURA_TELA) {
+
+      removerPrimeiro();
+
+      // Último personagem saiu:
+      // começa uma nova rodada com a mesma ordem
+      if (quantidadeFila == 0 && quantidadeOrdem > 0) {
+
+        montarFila();
+
+        status = "Nova rodada iniciada";
+
+        Serial.println("Nova rodada iniciada");
+      }
+    }
+  }
+
+  // Se ninguém está saindo, movimenta a fila
+  else {
+
+    for (uint8_t i = 0; i < quantidadeFila; i++) {
+
+      int destino = CENTRO_X - (i * ESPACO_FILA);
+
+      if (fila[i].x < destino) {
+
+        fila[i].x += VELOCIDADE;
+
+        // Não deixa ultrapassar o destino
+        if (fila[i].x > destino) {
+          fila[i].x = destino;
+        }
+      }
+    }
+  }
+
+  desenharTela();
+}
+
+// ====================================================
+// LEITURA DO BOTÃO FÍSICO
+// ====================================================
+
+void lerBotao() {
 
   bool leitura = digitalRead(PINO_BOTAO);
 
   if (leitura != ultimaLeituraBotao) {
 
-    ultimaLeituraBotao = leitura;
-    tempoDebounce = agora;
-
+    ultimoDebounce = millis();
   }
 
-  if (agora - tempoDebounce >= DEBOUNCE_MS) {
+  if ((millis() - ultimoDebounce) > TEMPO_DEBOUNCE) {
 
-    if (leitura != estadoEstavelBotao) {
+    if (leitura != estadoBotaoEstavel) {
 
-      estadoEstavelBotao = leitura;
+      estadoBotaoEstavel = leitura;
 
-      if (estadoEstavelBotao == LOW) {
+      // Botão pressionado
+      if (estadoBotaoEstavel == LOW) {
+
         avancarFila();
       }
     }
   }
+
+  ultimaLeituraBotao = leitura;
 }
 
-// =====================================
-// DESENHAR PERSONAGEM
-// =====================================
+// ====================================================
+// SINCRONIZAÇÃO COM ARDUINO CLOUD
+// ====================================================
 
-void desenharPersonagem(int indice, int frame) {
+void aoSincronizar() {
 
-  uint8_t id =
-    static_cast<uint8_t>(fila[indice].id);
+  cloudSincronizado = true;
 
-  display.drawBitmap(
-    fila[indice].x,
-    fila[indice].y,
-    sprites[id][frame],
-    LARGURA_SPRITE,
-    ALTURA_SPRITE,
-    SSD1306_WHITE
-  );
+  // Registra o valor que já estava no Cloud.
+  // Assim, ele não será executado automaticamente ao ligar.
+  ultimaOrdemProcessada = ordemIniciativa;
+
+  ultimaOrdemProcessada.trim();
+  ultimaOrdemProcessada.toUpperCase();
+
+  quantidadeFila = 0;
+  quantidadeOrdem = 0;
+
+  personagemSaindo = false;
+  modoMenu = true;
+
+  avancar = false;
+
+  status = "Menu";
+
+  mostrarLogo();
+
+  Serial.println("Arduino Cloud sincronizado");
 }
 
-// =====================================
-// ATUALIZAR ANIMAÇÃO
-// =====================================
-
-void atualizarSistema() {
-
-  static unsigned long ultimoFrame = 0;
-
-  unsigned long agora = millis();
-
-  if (agora - ultimoFrame < INTERVALO_MOVIMENTO) {
-    return;
-  }
-
-  ultimoFrame = agora;
-
-  display.clearDisplay();
-
-  // Fundo sempre desenhado primeiro
-  desenharFundo();
-
-  // =================================
-  // PERSONAGEM SAINDO
-  // =================================
-
-  if (personagemSaindo && quantidadeFila > 0) {
-
-    fila[0].x++;
-
-    // Quando sair completamente
-    if (fila[0].x >= LARGURA) {
-
-      removerPrimeiro();
-
-      personagemSaindo = false;
-
-      // Reinicia a rodada quando todos saírem
-      if (quantidadeFila == 0 &&
-          quantidadeOrdem > 0) {
-
-        montarFila();
-
-        status = "Nova rodada iniciada";
-      }
-    }
-  }
-
-  // =================================
-  // DESENHAR FILA
-  // =================================
-
-  if (personagemSaindo && quantidadeFila > 0) {
-
-    // Personagem atual caminhando para fora
-    int frameAtual =
-      1 + ((agora / (INTERVALO_MOVIMENTO *
-      VELOCIDADE_ANIMACAO)) % 2);
-
-    desenharPersonagem(0, frameAtual);
-
-    // Os demais aguardam de perfil
-    for (int i = 1; i < quantidadeFila; i++) {
-      desenharPersonagem(i, 1);
-    }
-  }
-
-  // =================================
-  // MOVIMENTO NORMAL
-  // =================================
-
-  else {
-
-    for (int i = 0; i < quantidadeFila; i++) {
-
-      int destinoX =
-        CENTRO_X - (i * ESPACO_FILA);
-
-      bool andando = fila[i].x < destinoX;
-
-      if (andando) {
-        fila[i].x++;
-      }
-
-      int frameAtual;
-
-      if (i == 0 && fila[i].x >= CENTRO_X) {
-
-        // Primeiro: olhando para frente
-        frameAtual = 0;
-
-      }
-      else if (andando) {
-
-        // Caminhando: frames 2 e 3
-        frameAtual =
-          1 + ((agora / (INTERVALO_MOVIMENTO *
-          VELOCIDADE_ANIMACAO) + i) % 2);
-
-      }
-      else {
-
-        // Esperando: perfil parado
-        frameAtual = 1;
-
-      }
-
-      desenharPersonagem(i, frameAtual);
-    }
-  }
-
-  display.display();
-}
-
-// =====================================
+// ====================================================
 // CALLBACKS DO ARDUINO CLOUD
-// =====================================
+// ====================================================
 
 void onOrdemIniciativaChange() {
 
-  configurarIniciativa(ordemIniciativa);
-}
+  if (!cloudSincronizado) return;
 
-void onFundoSelecionadoChange() {
+  String comando = ordemIniciativa;
 
-  if (FundoSelecionado < 0 ||
-      FundoSelecionado >= TOTAL_FUNDOS) {
+  comando.trim();
+  comando.toUpperCase();
 
-    status = "Fundo invalido";
-
-  }
-  else {
-
-    status = "Fundo selecionado: " +
-             String(FundoSelecionado);
-
+  // Ignora o valor antigo recebido na sincronização
+  if (comando == ultimaOrdemProcessada) {
+    return;
   }
 
-  Serial.println(status);
+  ultimaOrdemProcessada = comando;
+
+  configurarIniciativa(comando);
 }
+
 
 void onAvancarChange() {
+
+  if (!cloudSincronizado) return;
 
   if (avancar) {
 
     avancarFila();
 
-    // Retorna o botão virtual ao estado desligado
+    // Reseta o botão do Dashboard
     avancar = false;
   }
 }
 
+
+void onFundoSelecionadoChange() {
+
+  if (FundoSelecionado < 0 || FundoSelecionado >= TOTAL_FUNDOS) {
+
+    status = "Cenario invalido";
+
+    return;
+  }
+
+  status = "Cenario alterado";
+
+  desenharTela();
+}
+
+
 void onStatusChange() {
 
-  Serial.print("Status recebido: ");
-  Serial.println(status);
-}
-
-// Chamado quando todas as propriedades são sincronizadas
-void aoSincronizar() {
-
-  Serial.println("Arduino Cloud sincronizado!");
-
-  if (ordemIniciativa.length() > 0) {
-    configurarIniciativa(ordemIniciativa);
-  }
-
-  status = "Escudo conectado e pronto";
-}
-
-// =====================================
-// SETUP
-// =====================================
-
-void setup() {
-
-  Serial.begin(115200);
-
-  Wire.begin(8, 9);
-
-  pinMode(PINO_BOTAO, INPUT_PULLUP);
-
-  // Inicializa OLED
-  if (!display.begin(
-    SSD1306_SWITCHCAPVCC,
-    OLED_ENDERECO
-  )) {
-
-    Serial.println("Erro ao iniciar OLED!");
-
-    while (true) {
-      delay(100);
-    }
-  }
-
-  display.clearDisplay();
-
-  // Inicializa as propriedades do Cloud
-  initProperties();
-
-  // Fila padrão enquanto aguarda a sincronização
-  configurarIniciativa(
-    "BALAZAR,DIANA,KEYLETH,MILO,FRITZ,INIMIGO"
-  );
-
-  // Inicializa conexão com Arduino Cloud
-  ArduinoCloud.begin(
-    ArduinoIoTPreferredConnection
-  );
-
-  // Detecta sincronização inicial
-  ArduinoCloud.addCallback(
-    ArduinoIoTCloudEvent::SYNC,
-    aoSincronizar
-  );
-
-  setDebugMessageLevel(2);
-  ArduinoCloud.printDebugInfo();
-
-}
-
-// =====================================
-// LOOP PRINCIPAL
-// =====================================
-
-void loop() {
-
-  ArduinoCloud.update();
-
-  lerBotao();
-
-  atualizarSistema();
-
+  // Não precisamos executar nenhuma ação aqui.
 }
